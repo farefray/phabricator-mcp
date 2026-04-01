@@ -1,0 +1,9 @@
+[project]
+name = "phabricator-mcp"
+version = "0.1.0"
+description = "Minimal Phabricator Conduit MCP server for Claude Code"
+requires-python = ">=3.10"
+dependencies = ["mcp[cli]", "httpx"]
+
+[project.scripts]
+phabricator-mcp = "server:main"
