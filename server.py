@@ -1,8 +1,9 @@
 """
 Phabricator Conduit MCP Server
 
-A minimal MCP server that wraps the Phabricator Conduit API for read-oriented
-task management: look up tasks, read comments, search by user/project/query.
+A minimal MCP server that wraps the Phabricator Conduit API for task
+management: look up tasks, read comments, search by user/project/query,
+create new tasks, and post comments.
 
 Env vars:
   PHABRICATOR_URL   - Base URL (e.g. https://team.rootevidence.com)
@@ -296,6 +297,112 @@ def get_user_tasks(username: str, status: str = "open", limit: int = 30) -> str:
         limit: Max results to return (default 30, max 100).
     """
     return search_tasks(assigned_to=username, status=status, limit=limit)
+
+
+# --- Write tools --------------------------------------------------------------
+
+@mcp.tool()
+def create_task(
+    title: str,
+    description: str = "",
+    priority: str = "",
+    owner: str = "",
+    projects: str = "",
+) -> str:
+    """Create a new Phabricator task (Maniphest).
+
+    Returns the new task ID and URL on success.
+
+    Args:
+        title: Task title (required).
+        description: Task description in Remarkup format.
+        priority: Priority keyword: 'unbreak', 'triage', 'high', 'normal', 'low', 'wishlist'.
+        owner: Username to assign the task to.
+        projects: Comma-separated project/tag names to add to the task.
+    """
+    if not title.strip():
+        return "Title is required."
+
+    params: dict[str, Any] = {}
+    idx = 0
+
+    params[f"transactions[{idx}][type]"] = "title"
+    params[f"transactions[{idx}][value]"] = title.strip()
+    idx += 1
+
+    if description:
+        params[f"transactions[{idx}][type]"] = "description"
+        params[f"transactions[{idx}][value]"] = description
+        idx += 1
+
+    if priority:
+        valid = ("unbreak", "triage", "high", "normal", "low", "wishlist")
+        p = priority.strip().lower()
+        if p not in valid:
+            return f"Invalid priority '{priority}'. Use one of: {', '.join(valid)}"
+        params[f"transactions[{idx}][type]"] = "priority"
+        params[f"transactions[{idx}][value]"] = p
+        idx += 1
+
+    if owner:
+        user_phid = _resolve_user_phid(owner)
+        if not user_phid:
+            return f"User '{owner}' not found."
+        params[f"transactions[{idx}][type]"] = "owner"
+        params[f"transactions[{idx}][value]"] = user_phid
+        idx += 1
+
+    if projects:
+        proj_names = [p.strip() for p in projects.split(",") if p.strip()]
+        params[f"transactions[{idx}][type]"] = "projects.add"
+        for j, proj_name in enumerate(proj_names):
+            proj_result = conduit("project.search", {
+                "constraints[query]": proj_name,
+            })
+            proj_data = proj_result.get("data", [])
+            if not proj_data:
+                return f"Project '{proj_name}' not found."
+            params[f"transactions[{idx}][value][{j}]"] = proj_data[0]["phid"]
+        idx += 1
+
+    result = conduit("maniphest.edit", params)
+    obj = result.get("object", {})
+    task_id = obj.get("id", "")
+    phid = obj.get("phid", "")
+
+    return "\n".join([
+        f"# Created: T{task_id}",
+        f"**URL:** {PHAB_URL}/T{task_id}",
+        f"**PHID:** {phid}",
+    ])
+
+
+@mcp.tool()
+def add_comment(task_id: str, comment: str) -> str:
+    """Add a comment to a Phabricator task.
+
+    Args:
+        task_id: The task identifier (e.g. 'T1364' or '1364').
+        comment: The comment text in Remarkup format.
+    """
+    if not comment.strip():
+        return "Comment text is required."
+
+    clean = "".join(c for c in task_id if c.isdigit())
+    if not clean:
+        return f"Invalid task ID: {task_id}"
+
+    phid = _resolve_task_phid(task_id)
+    if not phid:
+        return f"Task {task_id} not found."
+
+    conduit("maniphest.edit", {
+        "objectIdentifier": phid,
+        "transactions[0][type]": "comment",
+        "transactions[0][value]": comment,
+    })
+
+    return f"Comment added to T{clean}.\n**URL:** {PHAB_URL}/T{clean}"
 
 
 # --- Entry point --------------------------------------------------------------
