@@ -122,8 +122,31 @@ get_user_tasks(username: "username", status: "closed", limit: 50)
 | `status` | string | `"open"` | `"open"`, `"closed"`, or `"any"` |
 | `limit` | int | `30` | Max results (capped at 100) |
 
+### `get_user_activity`
+
+Get recent activity for a user — comments, edits, task updates. Designed for weekly status summaries.
+
+```
+get_user_activity(username: "max")
+get_user_activity(username: "max", days: 14)
+get_user_activity(user_phid: "PHID-USER-ruacbzr534p25ifzonri", days: 7)
+```
+
+| Param | Type | Default | Description |
+|-------|------|---------|-------------|
+| `username` | string | `""` | Phabricator username. Ignored if `user_phid` is given. |
+| `user_phid` | string | `""` | User PHID — skips the username lookup round-trip. |
+| `days` | int | `7` | Days of history to retrieve |
+| `limit` | int | `100` | Max activity items (capped at 500) |
+| `comments_only` | bool | `False` | If True, filter to only tasks the user actually commented on and include comment text. Makes one extra `transaction.search` call per task. |
+
+**Default mode:** Tasks the user was active on (includes status changes, board moves, etc.), newest-first.  
+**`comments_only=True` mode:** Only tasks with real comments, with full comment text quoted. Useful for weekly reports — filters out pure triage/admin activity.  
+**Tip:** If team member PHIDs are stored locally (e.g. in `agentic_docs/people.md`), pass `user_phid` directly for efficiency.
+
 ## Notes
 
 - Owner fields return raw PHIDs (e.g. `PHID-USER-xxx`). Use `search_user` to resolve to human names.
 - Comment timestamps are Unix epoch seconds. Convert with standard tools (e.g. `date -d @1774600507`).
 - The server calls Phabricator's Conduit REST API (`/api/<method>`) under the hood via `httpx`.
+- `get_user_activity` uses `feed.query` which has no server-side date filter — date filtering is done client-side, so very large `days` values with high-volume users may hit the 200-item page cap.

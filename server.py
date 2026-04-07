@@ -299,6 +299,177 @@ def get_user_tasks(username: str, status: str = "open", limit: int = 30) -> str:
     return search_tasks(assigned_to=username, status=status, limit=limit)
 
 
+@mcp.tool()
+def get_user_activity(
+    username: str = "",
+    user_phid: str = "",
+    days: int = 7,
+    limit: int = 100,
+    comments_only: bool = False,
+) -> str:
+    """Get recent Phabricator activity for a user — comments, edits, and task updates.
+
+    Useful for generating weekly status summaries. Returns activity newest-first
+    within the requested time window. If the user's PHID is already known (e.g.
+    from agentic_docs/people.md), pass it via user_phid to skip the username lookup.
+
+    Args:
+        username: Phabricator username (e.g. 'max'). Ignored if user_phid is given.
+        user_phid: User PHID (e.g. 'PHID-USER-...') — takes precedence over username.
+        days: Days of history to retrieve (default 7).
+        limit: Max activity items to return (default 100, max 500).
+        comments_only: If True, only return tasks where the user left a comment,
+                       and include the comment text. Filters out pure status/board
+                       moves. Makes one extra API call per task found. Default False.
+    """
+    import time
+    from datetime import datetime, timezone
+
+    # Resolve PHID — accept direct PHID to avoid an extra round-trip when
+    # the PHID is already known (e.g. from agentic_docs/people.md).
+    phid = user_phid.strip() or None
+    if not phid:
+        if not username.strip():
+            return "Provide either username or user_phid."
+        phid = _resolve_user_phid(username.strip())
+        if not phid:
+            return f"User '{username}' not found."
+
+    since_ts = int(time.time()) - (days * 86400)
+    cap = min(limit, 500)
+
+    # feed.query filters activity by PHID. Date filtering is client-side:
+    # the API has no "since" constraint — only cursor-based pagination via
+    # the "before" chronological key.
+    params: dict[str, Any] = {
+        "filterPHIDs[0]": phid,
+        "limit": min(cap, 200),
+    }
+
+    result = conduit("feed.query", params)
+
+    # feed.query returns a dict keyed by chronological story key, not a list.
+    if not isinstance(result, dict):
+        return "Unexpected response format from feed.query."
+
+    # Collect stories within the time window, tracking earliest activity per task.
+    # objectPHID is nested inside story["data"], not at the top level.
+    task_activity: dict[str, dict] = {}  # objectPHID -> {first_epoch, last_epoch, count}
+    for story in result.values():
+        epoch = story.get("epoch", 0)
+        if epoch < since_ts:
+            continue
+        obj_phid = (story.get("data") or {}).get("objectPHID", "")
+        if not obj_phid or not obj_phid.startswith("PHID-TASK-"):
+            continue  # skip non-task activity (files, users, etc.)
+        if obj_phid not in task_activity:
+            task_activity[obj_phid] = {"first": epoch, "last": epoch, "count": 0}
+        entry = task_activity[obj_phid]
+        entry["count"] += 1
+        entry["first"] = min(entry["first"], epoch)
+        entry["last"] = max(entry["last"], epoch)
+
+    display_name = username.strip() or user_phid.strip()
+    if not task_activity:
+        return f"No task activity found for {display_name} in the last {days} days."
+
+    # Batch-fetch task titles for all touched tasks in one API call.
+    phid_list = list(task_activity.keys())[:cap]
+    params_lookup: dict[str, Any] = {"limit": len(phid_list)}
+    for i, p in enumerate(phid_list):
+        params_lookup[f"constraints[phids][{i}]"] = p
+    tasks_result = conduit("maniphest.search", params_lookup)
+    title_map: dict[str, str] = {}
+    status_map: dict[str, str] = {}
+    id_map: dict[str, str] = {}
+    for t in tasks_result.get("data", []):
+        p = t.get("phid", "")
+        fields = t.get("fields", {})
+        title_map[p] = fields.get("name", "(no title)")
+        status_map[p] = (fields.get("status", {}) or {}).get("name", "")
+        id_map[p] = f"T{t.get('id', '')}"
+
+    # Sort tasks by most recent activity first.
+    sorted_tasks = sorted(phid_list, key=lambda p: task_activity[p]["last"], reverse=True)
+
+    # --- Comments-only pass ---------------------------------------------------
+    # For each task, fetch transactions and extract comments by this user.
+    # Filters out tasks where the user only changed status, moved boards, etc.
+    task_comments: dict[str, list[dict]] = {}  # obj_phid -> [{date, text}]
+    if comments_only:
+        for obj_phid in sorted_tasks:
+            txn_result = conduit("transaction.search", {
+                "objectIdentifier": obj_phid,
+            })
+            for txn in txn_result.get("data", []):
+                if txn.get("authorPHID") != phid:
+                    continue
+                if txn.get("dateCreated", 0) < since_ts:
+                    continue  # comment posted outside the time window
+                comments = txn.get("comments", [])
+                if not comments:
+                    continue
+                text = comments[0].get("content", {}).get("raw", "").strip()
+                if text:
+                    if obj_phid not in task_comments:
+                        task_comments[obj_phid] = []
+                    task_comments[obj_phid].append({
+                        "date": txn.get("dateCreated", 0),
+                        "text": text,
+                    })
+        # Keep only tasks that have actual comments; re-sort by latest comment date.
+        sorted_tasks = [p for p in sorted_tasks if p in task_comments]
+        sorted_tasks.sort(
+            key=lambda p: max(c["date"] for c in task_comments[p]),
+            reverse=True,
+        )
+
+    # --- Format output --------------------------------------------------------
+    if not sorted_tasks:
+        label = "comments" if comments_only else "task activity"
+        return f"No {label} found for {display_name} in the last {days} days."
+
+    mode_label = "Comments by" if comments_only else "Tasks touched by"
+    lines = [
+        f"# {mode_label} {display_name} — last {days} days ({len(sorted_tasks)} tasks)",
+        "",
+    ]
+    for obj_phid in sorted_tasks:
+        entry = task_activity[obj_phid]
+        task_id = id_map.get(obj_phid, obj_phid)
+        title = title_map.get(obj_phid, "(unknown)")
+        status = status_map.get(obj_phid, "")
+        status_str = f" [{status}]" if status else ""
+
+        if comments_only:
+            comments_for_task = task_comments.get(obj_phid, [])
+            last_dt = datetime.fromtimestamp(
+                max(c["date"] for c in comments_for_task), tz=timezone.utc
+            ).strftime("%Y-%m-%d")
+            lines.append(f"## {task_id}{status_str} {title}")
+            lines.append(f"_{last_dt} · {len(comments_for_task)} comment(s) · {PHAB_URL}/{task_id}_")
+            lines.append("")
+            for c in sorted(comments_for_task, key=lambda x: x["date"]):
+                dt = datetime.fromtimestamp(c["date"], tz=timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M UTC"
+                )
+                lines.append(f"> **{dt}**")
+                # Indent comment lines for readability
+                for cline in c["text"].splitlines():
+                    lines.append(f"> {cline}")
+                lines.append("")
+        else:
+            last_dt = datetime.fromtimestamp(entry["last"], tz=timezone.utc).strftime("%Y-%m-%d")
+            lines.append(
+                f"- **{task_id}**{status_str} {title}  "
+                f"_(last active {last_dt}, {entry['count']} action(s))_"
+            )
+            lines.append(f"  {PHAB_URL}/{task_id}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
 # --- Write tools --------------------------------------------------------------
 
 @mcp.tool()
